@@ -9,7 +9,6 @@ from app.services import scraper_praktiker
 
 router = APIRouter(prefix="/match", tags=["match"])
 
-
 @router.post("/auto/{competitor_code}", response_model=dict)
 async def auto_match_all(competitor_code: str, session: AsyncSession = Depends(get_session)):
     comp = (
@@ -28,12 +27,15 @@ async def auto_match_all(competitor_code: str, session: AsyncSession = Depends(g
             created += 1
     return {"status": "ok", "created": created}
 
-
 @router.get("/view/{competitor_code}", response_model=list[dict])
 async def view_table(competitor_code: str, session: AsyncSession = Depends(get_session)):
     """
-    Returns per-item row: our item_id, our_sku, competitor_barcode (if matched), competitor_url (if matched),
-    approved flag.
+    Row per item:
+      - item_id
+      - our_sku
+      - comp_barcode (if matched & approved for this competitor)
+      - comp_url (clickable)
+      - approved
     """
     comp = (
         await session.execute(
@@ -42,13 +44,6 @@ async def view_table(competitor_code: str, session: AsyncSession = Depends(get_s
     ).scalar_one_or_none()
     if not comp:
         raise HTTPException(status_code=404, detail="Competitor not found")
-
-    # Left join items -> (approved match for this competitor) -> competitor product
-    sub = (
-        select(models.Match)
-        .where(models.Match.approved.is_(True))
-        .subquery()
-    )
 
     q = await session.execute(
         select(
@@ -67,31 +62,28 @@ async def view_table(competitor_code: str, session: AsyncSession = Depends(get_s
         .order_by(models.Item.id.asc())
     )
 
-    # Deduplicate to one row per item (prefer approved matches for this competitor)
     rows_map: dict[int, dict] = {}
     for item_id, our_sku, comp_barcode, comp_url, approved in q.all():
-        row = rows_map.get(item_id)
-        candidate = {
+        cand = {
             "item_id": item_id,
             "our_sku": our_sku,
             "comp_barcode": comp_barcode,
             "comp_url": comp_url,
             "approved": bool(approved),
         }
-        if row is None:
-            rows_map[item_id] = candidate
-        else:
-            # prefer approved True over False / None
-            if (not row.get("approved")) and candidate.get("approved"):
-                rows_map[item_id] = candidate
+        prev = rows_map.get(item_id)
+        if prev is None or (not prev["approved"] and cand["approved"]):
+            rows_map[item_id] = cand
 
-    # Ensure every item appears even if never matched
+    # Ensure every item appears
     all_items = (await session.execute(select(models.Item.id, models.Item.sku))).all()
     for item_id, sku in all_items:
-        rows_map.setdefault(item_id, {"item_id": item_id, "our_sku": sku, "comp_barcode": None, "comp_url": None, "approved": False})
+        rows_map.setdefault(item_id, {
+            "item_id": item_id, "our_sku": sku,
+            "comp_barcode": None, "comp_url": None, "approved": False
+        })
 
     return list(rows_map.values())
-
 
 @router.post("/manual_by_barcode/{competitor_code}", response_model=dict)
 async def manual_by_barcode(
@@ -101,8 +93,8 @@ async def manual_by_barcode(
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Manually link by providing competitor barcode.
-    We look up the product on competitor site by barcode, upsert CompetitorProduct, and create an APPROVED Match.
+    Manually link by competitor BARCODE: search praktiker, upsert competitor product,
+    create APPROVED match.
     """
     comp = (
         await session.execute(
@@ -118,31 +110,29 @@ async def manual_by_barcode(
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    # search competitor by given barcode
-    res = await scraper_praktiker.search_by_barcode(competitor_barcode)
-    if not res:
+    result = await scraper_praktiker.search_by_barcode(competitor_barcode)
+    if not result:
         raise HTTPException(status_code=404, detail="Competitor product not found by barcode")
 
-    # upsert competitor product
+    # upsert competitor product by (competitor_id, sku)
     q = await session.execute(
         select(models.CompetitorProduct).where(
             models.CompetitorProduct.competitor_id == comp.id,
-            models.CompetitorProduct.sku == res["sku"],
+            models.CompetitorProduct.sku == result["sku"],
         )
     )
     cp = q.scalar_one_or_none()
     if not cp:
         cp = models.CompetitorProduct(
             competitor_id=comp.id,
-            sku=res["sku"],
-            name=res["name"],
-            url=res["url"],
-            barcode=res.get("barcode") or competitor_barcode,
+            sku=result["sku"],
+            name=result["name"],
+            url=result["url"],
+            barcode=result.get("barcode") or competitor_barcode,
         )
         session.add(cp)
         await session.flush()
 
-    # create approved match
     match = models.Match(
         item_id=item.id,
         competitor_product_id=cp.id,
